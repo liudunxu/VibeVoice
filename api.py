@@ -314,8 +314,8 @@ def main():
     parser.add_argument(
         "--model_path",
         type=str,
-        default=os.environ.get("VIBEVOICE_MODEL_PATH", ""),
-        help="模型路径或 HuggingFace 模型名（也可通过环境变量 VIBEVOICE_MODEL_PATH 设置）",
+        default=os.environ.get("VIBEVOICE_MODEL_PATH", "/root/models"),
+        help="模型路径或 HuggingFace 模型名（也可通过环境变量 VIBEVOICE_MODEL_PATH 设置，默认：/root/models）",
     )
     parser.add_argument(
         "--device",
@@ -340,8 +340,8 @@ def main():
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("VIBEVOICE_PORT", "8000")),
-        help="监听端口",
+        default=int(os.environ.get("VIBEVOICE_PORT", "6006")),
+        help="监听端口（默认：6006）",
     )
     args = parser.parse_args()
 
