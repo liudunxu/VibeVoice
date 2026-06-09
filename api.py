@@ -64,7 +64,21 @@ class TranscribeRequest(BaseModel):
     )
     temperature: float = Field(default=0.0, ge=0.0, le=2.0, description="采样温度，0 表示贪婪解码")
     top_p: float = Field(default=1.0, ge=0.0, le=1.0, description="Top-p 核采样阈值")
-    num_beams: int = Field(default=1, ge=1, description="Beam search 束宽，1 表示贪婪解码")
+    num_beams: int = Field(
+        default=1, ge=1, le=8,
+        description=(
+            "Beam search 束宽。1 = 贪婪解码（默认，最快）；"
+            "推荐准确率优先场景设为 4（约 4x 慢，识别率通常提升 2-5%）。"
+        )
+    )
+    repetition_penalty: float = Field(
+        default=1.0, ge=1.0, le=2.0,
+        description=(
+            "重复惩罚系数。1.0 = 不惩罚（默认）；"
+            "1.05-1.10 适合长音频或重复语音（防止'嗯...啊...'循环）；"
+            "超过 1.2 会破坏正常重复（如'我我我'会被压成'我'）。"
+        )
+    )
 
     @model_validator(mode="after")
     def check_audio_source(self):
@@ -284,6 +298,7 @@ class VibeVoiceASRService:
         temperature: float = 0.0,
         top_p: float = 1.0,
         num_beams: int = 1,
+        repetition_penalty: float = 1.0,
     ) -> dict:
         """
         对单个音频文件进行转录。
@@ -295,6 +310,7 @@ class VibeVoiceASRService:
             temperature: 采样温度
             top_p: Top-p 阈值
             num_beams: Beam search 束宽
+            repetition_penalty: 重复惩罚系数，1.0 表示不惩罚
 
         Returns:
             dict 包含 raw_text、segments、generation_time 等字段
@@ -320,6 +336,7 @@ class VibeVoiceASRService:
             "eos_token_id": self.processor.tokenizer.eos_token_id,
             "do_sample": do_sample,
             "num_beams": num_beams,
+            "repetition_penalty": repetition_penalty,
         }
         if do_sample:
             generation_config["temperature"] = temperature
@@ -382,7 +399,8 @@ async def transcribe(request: TranscribeRequest):
         f"  - max_new_tokens={request.max_new_tokens} (None=auto-size from duration), "
         f"temperature={request.temperature}, "
         f"top_p={request.top_p}, "
-        f"num_beams={request.num_beams}"
+        f"num_beams={request.num_beams}, "
+        f"repetition_penalty={request.repetition_penalty}"
     )
 
     # 准备音频 bytes 和来源标识
@@ -410,6 +428,14 @@ async def transcribe(request: TranscribeRequest):
         raise HTTPException(status_code=400, detail="No audio data available")
 
     print(f"[ASR] decoded audio_bytes: {len(audio_bytes)} bytes, source={source_desc}")
+
+    # 1.5 提示：context_info 是提升准确率的最大单一杠杆
+    if not request.context_info:
+        print(
+            "[ASR] 💡 hint: context_info not provided. For higher accuracy, "
+            "pass hotwords / speaker names / domain terms via context_info "
+            "(see field description for examples)."
+        )
 
     # 2. 探测音频信息（不解码样本） + 写原始 bytes 临时文件（让 processor 用 ffmpeg 处理）
     #    避免 soundfile 重编码损失，同时正确处理 MP3/M4A/AAC/AMR 等格式
@@ -470,6 +496,7 @@ async def transcribe(request: TranscribeRequest):
             temperature=request.temperature,
             top_p=request.top_p,
             num_beams=request.num_beams,
+            repetition_penalty=request.repetition_penalty,
         )
         print(f"[ASR] transcribe done in {time.time() - t0:.2f}s, "
               f"raw_text_len={len(result.get('raw_text', ''))}, "
