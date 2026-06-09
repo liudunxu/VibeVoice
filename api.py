@@ -12,6 +12,7 @@ VibeVoice ASR API Server
 """
 
 import os
+import re
 import sys
 import argparse
 import base64
@@ -104,6 +105,39 @@ def estimate_max_new_tokens(duration_sec: float, upper_limit: int = 32768) -> in
     segment_overhead = num_segments * 40
     total = text_tokens + segment_overhead + 200
     return max(512, min(total, upper_limit))
+
+
+# 匹配整段由中括号包裹的非语音事件：[Silence] / [Music] / [Laughter] /
+# [Music] [Laughter] / [   ] 等
+_BRACKETED_NOISE_PATTERN = re.compile(r'^\s*(?:\[[^\]]*\]\s*)+$')
+
+
+def is_noise_segment(text: Optional[str]) -> bool:
+    """
+    判断转录片段是否仅包含中括号标注的非语音事件（噪声 / 静音 / 音乐等）。
+
+    匹配示例（会被过滤）：
+        - "[Silence]"
+        - "[Music]"
+        - "[Laughter]"
+        - "[Music] [Laughter]"
+        - "[  ]"
+
+    不匹配（会保留）：
+        - "Hello [Music] world"   ← 包含真实文字
+        - "[2024-01-15] 开个会"   ← 包含真实文字
+        - "你好"                  ← 无括号
+        - "" 或 None              ← 视为噪声
+
+    Args:
+        text: 转录文本
+
+    Returns:
+        True 表示该片段是噪声，应被过滤
+    """
+    if not text:
+        return True
+    return bool(_BRACKETED_NOISE_PATTERN.match(text))
 
 
 # =============================================================================
@@ -378,17 +412,24 @@ async def transcribe(request: TranscribeRequest):
         except OSError:
             pass
 
-    # 5. 映射字段并返回
+    # 5. 映射字段并返回（过滤纯括号噪声片段，如 [Silence] / [Music]）
     segments = []
+    filtered_noise = 0
     for seg in result.get("segments", []):
+        text = seg.get("text", "")
+        if is_noise_segment(text):
+            filtered_noise += 1
+            continue
         segments.append(
             Segment(
                 start=seg.get("start_time", 0.0),
                 end=seg.get("end_time", 0.0),
                 speaker=str(seg.get("speaker_id", "")),
-                content=seg.get("text", ""),
+                content=text,
             )
         )
+    if filtered_noise:
+        print(f"[ASR] filtered {filtered_noise} noise segment(s) (e.g. [Silence], [Music])")
 
     response = TranscribeResponse(
         segments=segments,
