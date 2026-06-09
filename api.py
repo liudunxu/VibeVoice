@@ -340,12 +340,14 @@ async def transcribe(request: TranscribeRequest):
             )
         )
 
-    print(f"[ASR] returning {len(segments)} segments, raw_text_len={len(result['raw_text'])}")
-    return TranscribeResponse(
+    response = TranscribeResponse(
         segments=segments,
         raw_text=result["raw_text"],
         generation_time=result["generation_time"],
     )
+    print(f"[ASR] returning {len(segments)} segments, raw_text_len={len(result['raw_text'])}")
+    print(f"[ASR] response: {response.model_dump_json(indent=2, ensure_ascii=False)}")
+    return response
 
 
 @app.get("/health")
