@@ -247,6 +247,20 @@ async def transcribe(request: TranscribeRequest):
     if asr_service is None:
         raise HTTPException(status_code=503, detail="ASR model not loaded yet")
 
+    # 打印入参（不打印 base64 原文，只打长度）
+    print("[ASR] /transcribe request:")
+    if request.audio_base64 is not None:
+        print(f"  - audio_base64: <provided, len={len(request.audio_base64)} chars>")
+    if request.audio_url is not None:
+        print(f"  - audio_url: {request.audio_url}")
+    print(f"  - context_info: {request.context_info!r}")
+    print(
+        f"  - max_new_tokens={request.max_new_tokens}, "
+        f"temperature={request.temperature}, "
+        f"top_p={request.top_p}, "
+        f"num_beams={request.num_beams}"
+    )
+
     # 准备音频 bytes 和来源标识
     audio_bytes: Optional[bytes] = None
     source_desc = ""
@@ -271,6 +285,8 @@ async def transcribe(request: TranscribeRequest):
     if audio_bytes is None:
         raise HTTPException(status_code=400, detail="No audio data available")
 
+    print(f"[ASR] decoded audio_bytes: {len(audio_bytes)} bytes, source={source_desc}")
+
     # 2. Bytes -> 临时音频文件（让 processor 自动处理格式与重采样）
     try:
         audio_buffer = io.BytesIO(audio_bytes)
@@ -279,14 +295,18 @@ async def transcribe(request: TranscribeRequest):
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = tmp.name
             sf.write(tmp_path, audio_array, sample_rate)
-    except Exception:
+        print(f"[ASR] temp wav: {tmp_path}, sr={sample_rate}, shape={getattr(audio_array, 'shape', None)}")
+    except Exception as e:
         # soundfile 无法识别时，回退为直接写入原始 bytes（ffmpeg 可能支持）
         with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
             tmp_path = tmp.name
             tmp.write(audio_bytes)
+        print(f"[ASR] soundfile read failed ({e}); fallback to raw .bin: {tmp_path}")
 
     try:
         # 3. 调用 ASR
+        print(f"[ASR] calling transcribe on {tmp_path} ...")
+        t0 = time.time()
         result = asr_service.transcribe(
             audio_path=tmp_path,
             context_info=request.context_info if request.context_info else None,
@@ -295,6 +315,9 @@ async def transcribe(request: TranscribeRequest):
             top_p=request.top_p,
             num_beams=request.num_beams,
         )
+        print(f"[ASR] transcribe done in {time.time() - t0:.2f}s, "
+              f"raw_text_len={len(result.get('raw_text', ''))}, "
+              f"segments={len(result.get('segments', []))}")
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
@@ -317,6 +340,7 @@ async def transcribe(request: TranscribeRequest):
             )
         )
 
+    print(f"[ASR] returning {len(segments)} segments, raw_text_len={len(result['raw_text'])}")
     return TranscribeResponse(
         segments=segments,
         raw_text=result["raw_text"],
