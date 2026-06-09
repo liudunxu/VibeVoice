@@ -25,8 +25,9 @@ import numpy as np
 import soundfile as sf
 import torch
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from uvicorn import run as uvicorn_run
+import requests
 
 from vibevoice.modular.modeling_vibevoice_asr import VibeVoiceASRForConditionalGeneration
 from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
@@ -36,9 +37,13 @@ from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
 # =============================================================================
 
 class TranscribeRequest(BaseModel):
-    audio_base64: str = Field(
-        ...,
-        description="Base64 编码的音频数据（支持 WAV、MP3、FLAC 等常见格式）"
+    audio_base64: Optional[str] = Field(
+        default=None,
+        description="Base64 编码的音频数据（支持 WAV、MP3、FLAC 等常见格式）。与 audio_url 二选一，优先使用此项。"
+    )
+    audio_url: Optional[str] = Field(
+        default=None,
+        description="音频文件 URL（支持 http/https）。与 audio_base64 二选一。"
     )
     context_info: Optional[str] = Field(
         default=None,
@@ -48,6 +53,12 @@ class TranscribeRequest(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0, description="采样温度，0 表示贪婪解码")
     top_p: float = Field(default=1.0, ge=0.0, le=1.0, description="Top-p 核采样阈值")
     num_beams: int = Field(default=1, ge=1, description="Beam search 束宽，1 表示贪婪解码")
+
+    @model_validator(mode="after")
+    def check_audio_source(self):
+        if not self.audio_base64 and not self.audio_url:
+            raise ValueError("必须提供 audio_base64 或 audio_url 之一")
+        return self
 
 
 class Segment(BaseModel):
@@ -236,14 +247,31 @@ async def transcribe(request: TranscribeRequest):
     if asr_service is None:
         raise HTTPException(status_code=503, detail="ASR model not loaded yet")
 
-    # 1. Base64 -> bytes
-    try:
-        audio_bytes = base64.b64decode(request.audio_base64)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid base64 audio data: {e}")
+    # 准备音频 bytes 和来源标识
+    audio_bytes: Optional[bytes] = None
+    source_desc = ""
+
+    if request.audio_base64:
+        # 优先使用 base64
+        try:
+            audio_bytes = base64.b64decode(request.audio_base64)
+            source_desc = "audio_base64"
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 audio data: {e}")
+    elif request.audio_url:
+        # 从 URL 下载
+        try:
+            resp = requests.get(request.audio_url, timeout=120)
+            resp.raise_for_status()
+            audio_bytes = resp.content
+            source_desc = request.audio_url
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to download audio from URL: {e}")
+
+    if audio_bytes is None:
+        raise HTTPException(status_code=400, detail="No audio data available")
 
     # 2. Bytes -> 临时音频文件（让 processor 自动处理格式与重采样）
-    # 先尝试用 soundfile 读取以推断格式，再用对应后缀创建临时文件
     try:
         audio_buffer = io.BytesIO(audio_bytes)
         audio_array, sample_rate = sf.read(audio_buffer)
