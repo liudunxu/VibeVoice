@@ -49,7 +49,11 @@ class TranscribeRequest(BaseModel):
         default=None,
         description="可选的上下文信息（如热词、说话人姓名、主题等），帮助提升转写质量"
     )
-    max_new_tokens: int = Field(default=8192, description="最大生成 token 数")
+    max_new_tokens: Optional[int] = Field(
+        default=None, ge=1, le=32768,
+        description="最大生成 token 数。留空（None）则根据音频时长自动估算，"
+                    "推荐大多数场景使用自动估算以避免长音频截断。",
+    )
     temperature: float = Field(default=0.0, ge=0.0, le=2.0, description="采样温度，0 表示贪婪解码")
     top_p: float = Field(default=1.0, ge=0.0, le=1.0, description="Top-p 核采样阈值")
     num_beams: int = Field(default=1, ge=1, description="Beam search 束宽，1 表示贪婪解码")
@@ -72,6 +76,34 @@ class TranscribeResponse(BaseModel):
     segments: List[Segment] = Field(..., description="结构化转录片段列表")
     raw_text: str = Field(..., description="模型原始输出文本")
     generation_time: float = Field(..., description="推理耗时（秒）")
+
+
+# =============================================================================
+# 工具函数
+# =============================================================================
+
+def estimate_max_new_tokens(duration_sec: float, upper_limit: int = 32768) -> int:
+    """
+    根据音频时长估算合适的 max_new_tokens。
+
+    估算依据：
+        - 输出文本密度约 2 token/s（含中英文常见情况）
+        - 每段 JSON 序列化开销约 40 token（Start time / End time / Speaker ID / Content）
+        - 假设平均段长 5s
+        - 加 200 token buffer 防止边界
+
+    Args:
+        duration_sec: 音频时长（秒）
+        upper_limit: 上限，默认 32768（与官方 demo 默认值一致）
+
+    Returns:
+        估算的 max_new_tokens 值，范围 [512, upper_limit]
+    """
+    text_tokens = int(duration_sec * 2)
+    num_segments = max(1, int(duration_sec / 5))
+    segment_overhead = num_segments * 40
+    total = text_tokens + segment_overhead + 200
+    return max(512, min(total, upper_limit))
 
 
 # =============================================================================
@@ -255,7 +287,7 @@ async def transcribe(request: TranscribeRequest):
         print(f"  - audio_url: {request.audio_url}")
     print(f"  - context_info: {request.context_info!r}")
     print(
-        f"  - max_new_tokens={request.max_new_tokens}, "
+        f"  - max_new_tokens={request.max_new_tokens} (None=auto-size from duration), "
         f"temperature={request.temperature}, "
         f"top_p={request.top_p}, "
         f"num_beams={request.num_beams}"
@@ -288,14 +320,17 @@ async def transcribe(request: TranscribeRequest):
     print(f"[ASR] decoded audio_bytes: {len(audio_bytes)} bytes, source={source_desc}")
 
     # 2. Bytes -> 临时音频文件（让 processor 自动处理格式与重采样）
+    audio_duration: Optional[float] = None  # 用于自适应 max_new_tokens
     try:
         audio_buffer = io.BytesIO(audio_bytes)
         audio_array, sample_rate = sf.read(audio_buffer)
+        audio_duration = len(audio_array) / sample_rate
         # 如果 soundfile 能读，说明格式受支持，直接写成临时 WAV
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = tmp.name
             sf.write(tmp_path, audio_array, sample_rate)
-        print(f"[ASR] temp wav: {tmp_path}, sr={sample_rate}, shape={getattr(audio_array, 'shape', None)}")
+        print(f"[ASR] temp wav: {tmp_path}, sr={sample_rate}, duration={audio_duration:.2f}s, "
+              f"shape={getattr(audio_array, 'shape', None)}")
     except Exception as e:
         # soundfile 无法识别时，回退为直接写入原始 bytes（ffmpeg 可能支持）
         with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
@@ -304,13 +339,28 @@ async def transcribe(request: TranscribeRequest):
         print(f"[ASR] soundfile read failed ({e}); fallback to raw .bin: {tmp_path}")
 
     try:
+        # 自适应 max_new_tokens：客户端未指定时按音频时长估算
+        if request.max_new_tokens is None:
+            if audio_duration is not None:
+                resolved_max_new_tokens = estimate_max_new_tokens(audio_duration)
+                print(f"[ASR] max_new_tokens auto-sized to {resolved_max_new_tokens} "
+                      f"(audio_duration={audio_duration:.2f}s)")
+            else:
+                # sf.read 失败无法获取时长，使用保守默认值
+                resolved_max_new_tokens = 16384
+                print(f"[ASR] max_new_tokens fallback to {resolved_max_new_tokens} "
+                      f"(audio_duration unknown)")
+        else:
+            resolved_max_new_tokens = request.max_new_tokens
+            print(f"[ASR] max_new_tokens from request: {resolved_max_new_tokens}")
+
         # 3. 调用 ASR
         print(f"[ASR] calling transcribe on {tmp_path} ...")
         t0 = time.time()
         result = asr_service.transcribe(
             audio_path=tmp_path,
             context_info=request.context_info if request.context_info else None,
-            max_new_tokens=request.max_new_tokens,
+            max_new_tokens=resolved_max_new_tokens,
             temperature=request.temperature,
             top_p=request.top_p,
             num_beams=request.num_beams,
