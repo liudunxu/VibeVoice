@@ -48,7 +48,14 @@ class TranscribeRequest(BaseModel):
     )
     context_info: Optional[str] = Field(
         default=None,
-        description="可选的上下文信息（如热词、说话人姓名、主题等），帮助提升转写质量"
+        description=(
+            "可选的上下文信息，能显著提升专有名词和说话人识别准确率。"
+            "推荐格式（可组合）："
+            "'There are 2 speakers.'  固定说话人数量；"
+            "'Speakers: Zhang San, Li Si.'  指定说话人姓名；"
+            "'Topic: AI research, transformer architecture.'  限定领域术语；"
+            "'Speaker 1 speaks Chinese, Speaker 2 speaks English.'  提示语种。"
+        )
     )
     max_new_tokens: Optional[int] = Field(
         default=None, ge=1, le=32768,
@@ -138,6 +145,57 @@ def is_noise_segment(text: Optional[str]) -> bool:
     if not text:
         return True
     return bool(_BRACKETED_NOISE_PATTERN.match(text))
+
+
+def probe_audio_duration_and_format(audio_bytes: bytes) -> tuple[Optional[float], str]:
+    """
+    探测音频时长和格式（不解码样本，避免 soundfile 重编码损失）。
+
+    优先 soundfile.info（仅读 header，毫秒级），fallback 到 ffprobe
+    （覆盖 MP3/M4A/AAC/AMR 等 soundfile 不识别的格式）。
+
+    Returns:
+        (duration_sec or None, file_suffix e.g. ".wav" / ".mp3" / ".bin")
+    """
+    # 1. soundfile 快速路径
+    try:
+        info = sf.info(io.BytesIO(audio_bytes))
+        return info.frames / info.samplerate, f".{info.format.lower()}"
+    except Exception:
+        pass
+
+    # 2. ffprobe fallback（覆盖 ffmpeg 支持的所有格式）
+    try:
+        from subprocess import run
+        result = run(
+            [
+                "ffprobe", "-v", "quiet",
+                "-show_entries", "format=duration:format=format_name",
+                "-of", "default=noprint_wrappers=1",
+                "-",  # stdin
+            ],
+            input=audio_bytes,
+            capture_output=True,
+            check=True,
+            timeout=10,
+        )
+        duration = None
+        fmt_name = None
+        for line in result.stdout.decode().strip().split("\n"):
+            if line.startswith("duration="):
+                try:
+                    duration = float(line.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif line.startswith("format_name="):
+                # 可能有多个（如 "mov,mp4,m4a"），取第一个
+                fmt_name = line.split("=", 1)[1].split(",")[0]
+        suffix = f".{fmt_name}" if fmt_name else ".bin"
+        return duration, suffix
+    except Exception:
+        pass
+
+    return None, ".bin"
 
 
 # =============================================================================
@@ -353,24 +411,38 @@ async def transcribe(request: TranscribeRequest):
 
     print(f"[ASR] decoded audio_bytes: {len(audio_bytes)} bytes, source={source_desc}")
 
-    # 2. Bytes -> 临时音频文件（让 processor 自动处理格式与重采样）
-    audio_duration: Optional[float] = None  # 用于自适应 max_new_tokens
+    # 2. 探测音频信息（不解码样本） + 写原始 bytes 临时文件（让 processor 用 ffmpeg 处理）
+    #    避免 soundfile 重编码损失，同时正确处理 MP3/M4A/AAC/AMR 等格式
+    audio_duration, audio_suffix = probe_audio_duration_and_format(audio_bytes)
+    with tempfile.NamedTemporaryFile(suffix=audio_suffix, delete=False) as tmp:
+        tmp_path = tmp.name
+        tmp.write(audio_bytes)
+    print(f"[ASR] temp file: {tmp_path}, size={len(audio_bytes)} bytes, "
+          f"duration={audio_duration}s, suffix={audio_suffix}")
+
+    # 2.5 音频质量诊断（帮助定位识别质量问题的原因）
     try:
-        audio_buffer = io.BytesIO(audio_bytes)
-        audio_array, sample_rate = sf.read(audio_buffer)
-        audio_duration = len(audio_array) / sample_rate
-        # 如果 soundfile 能读，说明格式受支持，直接写成临时 WAV
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
-            sf.write(tmp_path, audio_array, sample_rate)
-        print(f"[ASR] temp wav: {tmp_path}, sr={sample_rate}, duration={audio_duration:.2f}s, "
-              f"shape={getattr(audio_array, 'shape', None)}")
+        probe_buffer = io.BytesIO(audio_bytes)
+        probe_array, probe_sr = sf.read(probe_buffer, dtype="float32")
+        if probe_array.ndim > 1:
+            probe_array = probe_array.mean(axis=1)
+        peak = float(np.max(np.abs(probe_array)))
+        rms = float(np.sqrt(np.mean(probe_array ** 2)))
+        peak_db = 20 * np.log10(peak + 1e-10)
+        rms_db = 20 * np.log10(rms + 1e-10)
+        clipping = int(np.sum(np.abs(probe_array) > 0.99))
+        print(f"[ASR] audio quality: sr={probe_sr}Hz, "
+              f"peak={peak_db:.1f}dBFS, rms={rms_db:.1f}dBFS, "
+              f"clipping_samples={clipping}")
+        if peak_db > -1:
+            print(f"[ASR] ⚠️  audio is clipping (peak={peak_db:.1f}dBFS > -1dBFS), "
+                  f"speech content may be distorted")
+        elif rms_db < -40:
+            print(f"[ASR] ⚠️  audio is very quiet (rms={rms_db:.1f}dBFS < -40dBFS), "
+                  f"consider amplifying before recognition")
     except Exception as e:
-        # soundfile 无法识别时，回退为直接写入原始 bytes（ffmpeg 可能支持）
-        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
-            tmp_path = tmp.name
-            tmp.write(audio_bytes)
-        print(f"[ASR] soundfile read failed ({e}); fallback to raw .bin: {tmp_path}")
+        # soundfile 不支持的格式（MP3/M4A/AAC 等）会失败，跳过即可
+        print(f"[ASR] audio quality probe skipped: {e}")
 
     try:
         # 自适应 max_new_tokens：客户端未指定时按音频时长估算
